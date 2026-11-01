@@ -568,7 +568,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun scheduleIdle() { ui.removeCallbacks(idle); ui.postDelayed(idle, 5000) }
+    private fun scheduleIdle() { ui.removeCallbacks(idle); ui.postDelayed(idle, 180_000) }
 
     override fun onUserInteraction() { if (!dimmed) scheduleIdle() }
 

@@ -22,7 +22,7 @@ como `_lenslink._tcp`. El **plugin de OBS no se toca**: lo ve como un teléfono 
 - Botón redondo: iniciar/detener emisión. «⋯»: resolución, fps, códec, calidad, inicio remoto, servidor.
 
 ## Ahorro de batería
-- Tras **5 s sin tocar**: pantalla negra con brillo mínimo mostrando solo el % de batería (se desplaza cada 30 s
+- Tras **3 min sin tocar**: pantalla negra con brillo mínimo mostrando solo el % de batería (se desplaza cada 30 s
   para no marcar OLED). Un toque la despierta. La emisión a OBS **no se interrumpe**.
 - Si no se está emitiendo, al atenuar se cierra la cámara. En espera no se mantiene el wake lock de CPU.
 - Sin emitir, la vista previa va a 30 fps.
