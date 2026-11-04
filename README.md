@@ -14,7 +14,7 @@ como `_lenslink._tcp`. El **plugin de OBS no se toca**: lo ve como un teléfono 
 - Bitrates iguales a la tabla de iOS (4K = 30 Mbps H.264 / 18 Mbps HEVC; «maximum» ×1.5)
 
 ## Interfaz (v0.2)
-- Siempre horizontal, oscura y minimalista (acento ámbar). Vista previa 16:9 a pantalla completa.
+- Siempre horizontal, clara tipo cristal translúcido, con letras e iconos en gris oscuro (sin colores de acento). Vista previa 16:9 a pantalla completa.
 - **Pellizcar** = zoom · **tocar** = enfocar y medir luz · **arrastrar arriba/abajo tras enfocar** = exposición ·
   **mantener pulsado** = bloquear/liberar AE y balance de blancos.
 - Columna derecha: lentes (0.5 / 1 / 2 / 3 según el móvil), linterna, cambiar de cámara.

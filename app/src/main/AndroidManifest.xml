@@ -15,7 +15,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="LensLink v0.2"
+        android:label="LensLink v0.3"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
 

@@ -45,13 +45,9 @@ import kotlin.math.max
 import kotlin.math.sin
 
 // ---------------------------------------------------------------- paleta (oscuro + ámbar)
-private val AMBER = Color.parseColor("#F5C242")
-private val RED = Color.parseColor("#FF453A")
-private val TEXT = Color.parseColor("#F2F2F7")
-private val MUTED = Color.parseColor("#8E8E93")
-private val CHIP = Color.parseColor("#66000000")
-private val PANEL = Color.parseColor("#E6141414")
-private val FILL = Color.parseColor("#22FFFFFF")
+private val INK = Color.parseColor("#1C1C1E")   // texto e iconos principales (gris casi negro)
+private val INK2 = Color.parseColor("#5C5C61")  // texto secundario
+private val RED = Color.parseColor("#FF3B30")
 
 /** SurfaceView que mantiene 16:9 dentro del espacio disponible (letterbox). */
 private class AspectSurfaceView(ctx: Context) : SurfaceView(ctx) {
@@ -91,7 +87,7 @@ private class IconView(ctx: Context, private val kind: Int) : View(ctx) {
     override fun onDraw(c: Canvas) {
         val cx = width / 2f; val cy = height / 2f
         val s = minOf(width, height) * 0.30f
-        p.color = if (active) AMBER else TEXT
+        p.color = INK
         p.style = Paint.Style.STROKE
         when (kind) {
             BOLT -> {
@@ -127,7 +123,7 @@ private class IconView(ctx: Context, private val kind: Int) : View(ctx) {
 private class FocusRing(ctx: Context) : View(ctx) {
     private val d = resources.displayMetrics.density
     private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; color = AMBER; strokeWidth = 1.6f * d
+        style = Paint.Style.STROKE; color = Color.WHITE; strokeWidth = 2f * d
     }
     private var cx = 0f
     private var cy = 0f
@@ -181,12 +177,14 @@ class MainActivity : Activity() {
     private lateinit var settings: ScrollView
     private lateinit var serverBtn: TextView
     private lateinit var ipText: TextView
+    private lateinit var capsText: TextView
     private lateinit var dimLayer: FrameLayout
     private lateinit var dimBattery: TextView
 
     private val lensChips = ArrayList<TextView>()
     private var lensKey = ""
     private val segSetters = HashMap<String, (String) -> Unit>()
+    private val segViews = HashMap<String, List<Pair<String, TextView>>>()
 
     private var dimmed = false
     private var surfaceOk = false
@@ -200,7 +198,7 @@ class MainActivity : Activity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    private fun label(text: String, sp: Float, color: Int = TEXT, face: String = "sans-serif-medium",
+    private fun label(text: String, sp: Float, color: Int = INK, face: String = "sans-serif-medium",
                       caps: Boolean = false): TextView = TextView(this).apply {
         this.text = text
         textSize = sp
@@ -214,6 +212,16 @@ class MainActivity : Activity() {
         setColor(color)
         cornerRadius = dp(radiusDp).toFloat()
         if (stroke != 0) setStroke(dp(1), stroke)
+    }
+
+    /** Fondo tipo cristal: blanco translúcido con degradado suave y borde claro. */
+    private fun glass(radiusDp: Int, strong: Boolean = false) = GradientDrawable(
+        GradientDrawable.Orientation.TOP_BOTTOM,
+        intArrayOf(Color.parseColor(if (strong) "#F5FFFFFF" else "#B8FFFFFF"),
+                   Color.parseColor(if (strong) "#E0F2F2F7" else "#8CFFFFFF"))
+    ).apply {
+        cornerRadius = dp(radiusDp).toFloat()
+        setStroke(dp(1), Color.parseColor("#99FFFFFF"))
     }
 
     private fun lp(w: Int, h: Int, g: Int = Gravity.NO_GRAVITY) = FrameLayout.LayoutParams(w, h, g)
@@ -275,16 +283,16 @@ class MainActivity : Activity() {
         }
 
         statusPill = label("", 12f).apply {
-            background = pill(CHIP, 20)
+            background = glass(20)
             setPadding(dp(12), dp(7), dp(12), dp(7))
         }
         controls.addView(statusPill, lp(-2, -2, Gravity.TOP or Gravity.START))
 
         val topRight = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        batteryText = label("", 12f, MUTED)
+        batteryText = label("", 12f, INK2).apply { background = glass(14); setPadding(dp(10), dp(6), dp(10), dp(6)) }
         topRight.addView(batteryText, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(10) })
         val dots = IconView(this, IconView.DOTS).apply {
-            background = pill(CHIP, 20)
+            background = glass(20)
             setOnClickListener { toggleSettings() }
         }
         topRight.addView(dots, LinearLayout.LayoutParams(dp(40), dp(40)))
@@ -295,34 +303,35 @@ class MainActivity : Activity() {
         lensCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
         right.addView(lensCol)
         flashBtn = IconView(this, IconView.BOLT).apply {
-            background = pill(CHIP, 20)
+            background = glass(20)
             setOnClickListener {
                 val e = StreamService.instance?.engine ?: return@setOnClickListener
                 if (!e.hasTorch()) { toast("Esta cámara no tiene linterna"); return@setOnClickListener }
                 e.setTorch(!e.torchOn()); active = e.torchOn()
+                background = if (e.torchOn()) glass(20, true) else glass(20)
             }
         }
         right.addView(flashBtn, LinearLayout.LayoutParams(dp(40), dp(40)).apply { topMargin = dp(10) })
         val flip = IconView(this, IconView.FLIP).apply {
-            background = pill(CHIP, 20)
+            background = glass(20)
             setOnClickListener { StreamService.instance?.engine?.flip(); flashBtn.active = false }
         }
         right.addView(flip, LinearLayout.LayoutParams(dp(40), dp(40)).apply { topMargin = dp(10) })
         controls.addView(right, lp(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL))
 
         // abajo: look (centro), obturador (derecha), lectura (izquierda)
-        lookPill = label("NATURAL", 12f, TEXT, caps = true).apply {
-            background = pill(CHIP, 20, FILL)
+        lookPill = label("NATURAL", 12f, INK, caps = true).apply {
+            background = glass(20)
             setPadding(dp(16), dp(9), dp(16), dp(9))
             setOnClickListener { cycleLook() }
         }
         controls.addView(lookPill, lp(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(6) })
 
-        hud = label("", 13f, AMBER, "sans-serif-medium").apply { alpha = 0f }
+        hud = label("", 13f, INK).apply { alpha = 0f; background = glass(14); setPadding(dp(12), dp(6), dp(12), dp(6)) }
         controls.addView(hud, lp(-2, -2, Gravity.BOTTOM or Gravity.START).apply { bottomMargin = dp(16) })
 
         val shutter = FrameLayout(this).apply {
-            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT); setStroke(dp(3), TEXT) }
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT); setStroke(dp(3), Color.WHITE) }
             setOnClickListener { toggleStream() }
         }
         shutterDot = View(this)
@@ -353,23 +362,20 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(14))
         }
-        col.addView(label("Ajustes", 16f, TEXT, "sans-serif-light"))
+        col.addView(label("Ajustes", 16f, INK, "sans-serif-light"))
         fun add(v: View) = col.addView(v, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
 
         add(segmented("res", "Resolución", listOf("720p" to "720p", "1080p" to "1080p", "4K" to "4K")) { v ->
             prefs.edit().putString("res", v).apply()
-            val e = StreamService.instance?.engine
-            if (e != null && !e.setFormat(v, null, null)) toast("Ese formato no lo soporta esta cámara")
+            applyFormat(v, null, null)
         })
         add(segmented("fps", "Fotogramas", listOf("30" to "30", "60" to "60")) { v ->
             prefs.edit().putInt("fps", v.toInt()).apply()
-            val e = StreamService.instance?.engine
-            if (e != null && !e.setFormat(null, v.toInt(), null)) toast("Ese formato no lo soporta esta cámara")
+            applyFormat(null, v.toInt(), null)
         })
         add(segmented("codec", "Códec", listOf("hevc" to "HEVC", "h264" to "H.264")) { v ->
             prefs.edit().putString("codec", v).apply()
-            val e = StreamService.instance?.engine
-            if (e != null && !e.setFormat(null, null, v)) toast("Ese códec no está disponible")
+            applyFormat(null, null, v)
         })
         add(segmented("quality", "Calidad", listOf("balanced" to "Equilibrada", "maximum" to "Máxima")) { v ->
             prefs.edit().putString("quality", v).apply()
@@ -380,18 +386,21 @@ class MainActivity : Activity() {
             StreamService.instance?.changeArmed(v == "on")
         })
 
-        serverBtn = label("", 13f, TEXT).apply {
+        serverBtn = label("", 13f, INK).apply {
             gravity = Gravity.CENTER
-            background = pill(FILL, 14)
+            background = pill(Color.parseColor("#14000000"), 14)
             setPadding(dp(12), dp(10), dp(12), dp(10))
             setOnClickListener { toggleServer() }
         }
         add(serverBtn)
-        ipText = label("", 11f, MUTED, "sans-serif")
+        ipText = label("", 11f, INK2, "sans-serif")
         add(ipText)
+        add(label("Admite esta cámara", 10f, INK2, caps = true))
+        capsText = label("", 11f, INK, "sans-serif")
+        col.addView(capsText, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
 
         return ScrollView(this).apply {
-            background = pill(PANEL, 18)
+            background = glass(18, true)
             isVerticalScrollBarEnabled = false
             addView(col)
         }
@@ -400,20 +409,21 @@ class MainActivity : Activity() {
     private fun segmented(key: String, title: String, options: List<Pair<String, String>>,
                           onPick: (String) -> Unit): View {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        col.addView(label(title, 10f, MUTED, caps = true))
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; background = pill(FILL, 14) }
+        col.addView(label(title, 10f, INK2, caps = true))
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; background = pill(Color.parseColor("#14000000"), 14) }
         val views = options.map { (value, text) ->
             label(text, 12f).apply {
                 gravity = Gravity.CENTER
                 setPadding(dp(6), dp(8), dp(6), dp(8))
-                setOnClickListener { onPick(value); segSetters[key]?.invoke(value) }
+                setOnClickListener { onPick(value); refresh() }
             }.also { row.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
         }
+        segViews[key] = options.map { it.first }.zip(views)
         segSetters[key] = { sel ->
             options.forEachIndexed { i, o ->
                 val on = o.first == sel
-                views[i].setTextColor(if (on) Color.BLACK else TEXT)
-                views[i].background = if (on) pill(AMBER, 12) else null
+                views[i].setTextColor(if (on) INK else INK2)
+                views[i].background = if (on) pill(Color.WHITE, 12) else null
             }
         }
         col.addView(row, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5) })
@@ -481,6 +491,20 @@ class MainActivity : Activity() {
         hud.alpha = 1f
         ui.removeCallbacks(hudHide)
         ui.postDelayed(hudHide, 1200)
+    }
+
+    private fun applyFormat(res: String?, fps: Int?, codec: String?) {
+        val e = StreamService.instance?.engine ?: return
+        when (e.setFormat(res, fps, codec)) {
+            0 -> toast(if (fps != null) "${e.resolution} a $fps fps no está disponible en este móvil"
+                       else "Ese formato no lo soporta esta cámara")
+            2 -> toast("${e.resolution}: en este móvil el máximo es 30 fps")
+        }
+        prefs.edit().putString("res", e.resolution).putInt("fps", e.fps).putString("codec", e.codec).apply()
+    }
+
+    private fun dimOptions(key: String, available: Set<String>) {
+        segViews[key]?.forEach { (v, view) -> view.alpha = if (v in available) 1f else 0.35f }
     }
 
     private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
@@ -656,8 +680,8 @@ class MainActivity : Activity() {
             val on = i == sel
             val c = lensChips[i]
             c.text = if (on) fmtZ(z) + "×" else fmtZ(factor)
-            c.setTextColor(if (on) AMBER else TEXT)
-            c.background = pill(if (on) Color.parseColor("#99000000") else CHIP, 20)
+            c.setTextColor(if (on) INK else INK2)
+            c.background = if (on) glass(20, true) else glass(20)
         }
     }
 
@@ -693,13 +717,15 @@ class MainActivity : Activity() {
         shutterDot.background = GradientDrawable().apply {
             if (e?.running == true) { shape = GradientDrawable.RECTANGLE; cornerRadius = dp(10).toFloat() }
             else shape = GradientDrawable.OVAL
-            setColor(if (e?.running == true) RED else TEXT)
+            setColor(if (e?.running == true) RED else Color.WHITE)
         }
 
         // look y lentes
         val look = e?.looks()?.firstOrNull { it.first == e.currentLook }
         lookPill.text = look?.second ?: "Natural"
-        flashBtn.active = e?.torchOn() == true
+        val torch = e?.torchOn() == true
+        flashBtn.active = torch
+        flashBtn.background = if (torch) glass(20, true) else glass(20)
         updateLensChips()
 
         // ajustes sincronizados con el estado real (OBS también puede cambiarlos)
@@ -708,6 +734,14 @@ class MainActivity : Activity() {
         segSetters["codec"]?.invoke(e?.codec ?: prefs.getString("codec", "hevc") ?: "hevc")
         segSetters["quality"]?.invoke(e?.quality ?: prefs.getString("quality", "balanced") ?: "balanced")
         segSetters["armed"]?.invoke(if (s?.armed ?: prefs.getBoolean("armed", false)) "on" else "off")
+        if (e != null) {
+            val mx = e.formatMatrix()
+            dimOptions("res", mx.filter { it.value.isNotEmpty() }.keys)
+            dimOptions("fps", (mx[e.resolution] ?: emptyList()).map { it.toString() }.toSet())
+            capsText.text = mx.entries.joinToString("\n") {
+                "${it.key}   ${it.value.joinToString(" · ").ifEmpty { "no disponible" }} fps"
+            }
+        }
         serverBtn.text = if (s == null) "Encender servidor" else "Apagar servidor"
         ipText.text = "${localIps()} : ${Proto.PORT}" +
             (if (s?.obsHost?.isNotEmpty() == true) "\nOBS: ${s.obsHost}" else "")

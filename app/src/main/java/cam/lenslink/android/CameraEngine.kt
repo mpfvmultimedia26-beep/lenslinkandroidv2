@@ -151,16 +151,29 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
         }
     }
 
-    /** Cambiar formato: si está corriendo, se reconstruye sesión y encoder. */
-    fun setFormat(res: String?, fpsValue: Int?, codecValue: String?): Boolean {
+    /**
+     * Cambiar formato. Devuelve 0 = no soportado, 1 = aplicado, 2 = aplicado pero con menos fps
+     * de los que había (p. ej. 4K60 no se ofrece por Camera2 en muchos móviles, sí 4K30).
+     */
+    fun setFormat(res: String?, fpsValue: Int?, codecValue: String?): Int {
         val r = res ?: resolution
-        val f = fpsValue ?: fps
+        var f = fpsValue ?: fps
         val c = codecValue ?: codec
-        val id = curId() ?: return false
-        if (!supports(id, r, f, c)) return false
+        val id = curId() ?: return 0
+        var result = 1
+        if (!supports(id, r, f, c)) {
+            if (fpsValue == null && f > 30 && supports(id, r, 30, c)) { f = 30; result = 2 }
+            else return 0
+        }
         resolution = r; fps = f; codec = c
         if (running) restartAsync() else cb.onStateChanged()
-        return true
+        return result
+    }
+
+    /** resolución -> fps que cámara y encoder admiten a la vez (con el códec actual). */
+    fun formatMatrix(): Map<String, List<Int>> {
+        val id = curId() ?: return emptyMap()
+        return listOf("720p", "1080p", "4K").associateWith { r -> listOf(30, 60).filter { supports(id, r, it, codec) } }
     }
 
     fun changeQuality(q: String) {
