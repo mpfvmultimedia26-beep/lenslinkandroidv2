@@ -9,6 +9,8 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.TonemapCurve
 import android.media.MediaCodec
@@ -82,6 +84,56 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
     private val activeTargets = mutableListOf<Surface>()
     @Volatile var lastError: String? = null
 
+    // Recuperación automática
+    @Volatile var recovering = false
+        private set
+    private var recoverAttempts = 0
+    private val recoverDelays = longArrayOf(1000, 2000, 4000, 8000, 15000)
+    private val retryRun = Runnable {
+        if (wantStream || previewSurface?.isValid == true) reconfigure()
+    }
+    private val resetAttempts = Runnable { recoverAttempts = 0 }
+
+    // Control de temperatura
+    @Volatile var thermalLevel = 0
+        private set
+    @Volatile var thermalCapped = false
+        private set
+    private var thermalScale = 1.0
+    @Volatile var batteryLow = false
+        private set
+    private var capsSuspended = false   // el usuario eligió formato a mano mientras había un límite
+    private var savedFps: Int? = null
+    private var savedRes: String? = null
+    private fun capWanted() = thermalLevel >= 3 || batteryLow
+
+    private val restoreRun = Runnable {
+        if (!capWanted() && (savedFps != null || savedRes != null)) {
+            val id = curId()
+            val r = savedRes ?: resolution
+            val f = savedFps ?: fps
+            savedFps = null; savedRes = null; thermalCapped = false
+            if (id != null && supports(id, r, f, codec)) {
+                resolution = r; fps = f
+                DiagLog.add("vuelve al formato elegido: $r ${f}fps")
+                if (running) restartAsync()
+            }
+            cb.onStateChanged()
+        }
+    }
+
+    // Últimos valores reales de la cámara (para mostrarlos y para pasar a manual sin saltos)
+    @Volatile private var lastIso = 0
+    @Volatile private var lastExpNs = 0L
+    @Volatile private var lastFocusD = 0f
+    private val captureCb = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
+            res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
+            res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastExpNs = it }
+            res.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { lastFocusD = it }
+        }
+    }
+
     // ---- Estado de la sesión ----
     private var chars: CameraCharacteristics? = null
     private var device: CameraDevice? = null
@@ -116,7 +168,15 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
     // ------------------------------------------------------------------ API pública
 
     /** Empieza a emitir (enciende el encoder). La vista previa, si hay, sigue igual. */
-    fun start() { handler.post { wantStream = true; reconfigure() } }
+    fun start() {
+        handler.post {
+            wantStream = true
+            recoverAttempts = 0; recovering = false
+            handler.removeCallbacks(retryRun)
+            DiagLog.add("emisión: $resolution ${fps}fps $codec")
+            reconfigure()
+        }
+    }
 
     /** Deja de emitir; si hay superficie de vista previa, la cámara sigue abierta para verla. */
     fun stop() {
@@ -124,6 +184,9 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
             val was = wantStream
             wantStream = false
             previewBlocked = false
+            recovering = false
+            handler.removeCallbacks(retryRun)
+            DiagLog.add("emisión detenida")
             reconfigure()
             if (was) cb.onStopped(null)
         }
@@ -166,6 +229,9 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
             else return 0
         }
         resolution = r; fps = f; codec = c
+        savedFps = null; savedRes = null; thermalCapped = false
+        if (capWanted()) capsSuspended = true
+        DiagLog.add("formato: $r ${f}fps $c")
         if (running) restartAsync() else cb.onStateChanged()
         return result
     }
@@ -278,7 +344,7 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
         val withPreview = pv != null && pv.isValid && !(wantStream && previewBlocked)
         if (!wantStream && !withPreview) return
         val id = curId()
-        if (id == null) { fail("No se encontró cámara"); return }
+        if (id == null) { fail("No se encontró cámara", retry = false); return }
         try {
             val ch = mgr.getCameraCharacteristics(id)
             chars = ch
@@ -309,11 +375,29 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
         }
     }
 
-    private fun fail(msg: String) {
+    /** Falla de cámara/encoder. Si era recuperable, se reintenta con espera creciente. */
+    private fun fail(msg: String, retry: Boolean = true) {
+        DiagLog.add("fallo: $msg")
+        if (stab == "cinematic" && msg.startsWith("Error de cámara")) {
+            stab = "standard"
+            DiagLog.add("la estabilización cinematográfica falló: se usa la estándar")
+        }
         val wasStreaming = wantStream
-        wantStream = false
+        val wantsPreview = previewSurface?.isValid == true
         stopInternal()
         lastError = msg
+        handler.removeCallbacks(retryRun)
+        if (retry && (wasStreaming || wantsPreview) && recoverAttempts < recoverDelays.size) {
+            val d = recoverDelays[recoverAttempts++]
+            recovering = true
+            lastError = "$msg · reintentando en ${d / 1000}s"
+            DiagLog.add("reintento $recoverAttempts/${recoverDelays.size} en ${d / 1000}s")
+            handler.postDelayed(retryRun, d)
+            cb.onStateChanged()
+            return
+        }
+        recovering = false
+        wantStream = false
         if (wasStreaming) cb.onStopped(msg) else cb.onStateChanged()
     }
 
@@ -324,7 +408,7 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
         val pv = previewSurface
         val usePreview = withPreview && pv != null && pv.isValid
         if (usePreview) targets += pv!!
-        if (targets.isEmpty()) { fail("Sin destino de vídeo"); return }
+        if (targets.isEmpty()) { fail("Sin destino de vídeo", retry = false); return }
         try {
             camera.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
@@ -332,6 +416,10 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
                     activeTargets.clear()
                     activeTargets.addAll(targets)
                     if (!previewBlocked) lastError = null
+                    if (recovering) DiagLog.add("recuperado")
+                    recovering = false
+                    handler.removeCallbacks(resetAttempts)
+                    handler.postDelayed(resetAttempts, 20_000)
                     applyRequest()
                     if (encSurface != null) {
                         running = true
@@ -347,7 +435,7 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
                         lastError = "Vista previa desactivada: $resolution ${fps}fps no cabe con ella"
                         createSession(camera, sz, false)
                     } else {
-                        fail("La cámara no admite $resolution ${fps}fps")
+                        fail("La cámara no admite $resolution ${fps}fps", retry = false)
                     }
                 }
             }, handler)
@@ -382,7 +470,7 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
         return (perFps * q).toInt()
     }
 
-    private fun currentBitrate() = (baseBitrate() * bitrateScale).toInt()
+    private fun currentBitrate() = (baseBitrate() * bitrateScale * thermalScale).toInt()
 
     private fun applyBitrate() {
         encHandler.post {
@@ -399,7 +487,7 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
         override fun onOutputFormatChanged(c: MediaCodec, f: MediaFormat) {}
         override fun onError(c: MediaCodec, e: MediaCodec.CodecException) {
             Log.e(TAG, "encoder error", e)
-            handler.post { stopInternal(); cb.onStopped("Error del encoder") }
+            handler.post { fail("Error del encoder") }
         }
         override fun onOutputBufferAvailable(c: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
             try {
@@ -576,7 +664,7 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
             applyLook(r, ch)
             applyRegions(r, ch)
 
-            s.setRepeatingRequest(r.build(), null, handler)
+            s.setRepeatingRequest(r.build(), captureCb, handler)
         } catch (e: Exception) {
             Log.w(TAG, "apply failed: ${e.message}")
         }
@@ -726,6 +814,238 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
         }
     }
 
+    // ------------------------------------------------------------------ temperatura
+
+    /**
+     * Reevalúa los límites automáticos. Calor severo (>=3) o batería baja: máx. 30 fps.
+     * Calor crítico (>=4) o batería baja: 4K baja a 1080p. Al desaparecer el motivo, vuelve a lo elegido tras 1 min.
+     */
+    private fun reevaluateCaps() {
+        handler.removeCallbacks(restoreRun)
+        if (!capWanted()) capsSuspended = false
+        if (capsSuspended) return
+        val id = curId()
+        val wantFps30 = thermalLevel >= 3 || batteryLow
+        val want1080 = thermalLevel >= 4 || batteryLow
+        if (id != null && (wantFps30 || want1080)) {
+            var changed = false
+            if (wantFps30 && fps > 30 && supports(id, resolution, 30, codec)) {
+                if (savedFps == null) savedFps = fps
+                fps = 30; changed = true
+            }
+            if (want1080 && resolution == "4K" && supports(id, "1080p", fps, codec)) {
+                if (savedRes == null) savedRes = resolution
+                resolution = "1080p"; changed = true
+            }
+            if (changed) {
+                thermalCapped = true
+                DiagLog.add("límite automático: $resolution ${fps}fps (calor=$thermalLevel, batería baja=$batteryLow)")
+                if (running) restartAsync()
+            }
+        } else if (savedFps != null || savedRes != null) {
+            handler.postDelayed(restoreRun, 60_000)
+        }
+    }
+
+    /** Nivel de PowerManager.getCurrentThermalStatus(): 0 normal ... 3 severo, 4+ crítico. */
+    fun setThermalLevel(level: Int) {
+        handler.post {
+            thermalLevel = level
+            DiagLog.add("temperatura: nivel $level")
+            thermalScale = when { level >= 3 -> 0.5; level == 2 -> 0.7; else -> 1.0 }
+            if (running) applyBitrate()
+            reevaluateCaps()
+            cb.onStateChanged()
+        }
+    }
+
+    /** Lo decide el servicio: batería <= 20 % sin cargar (se levanta con >= 25 % o al enchufar). */
+    fun setBatteryLow(low: Boolean) {
+        handler.post {
+            if (batteryLow == low) return@post
+            batteryLow = low
+            DiagLog.add("batería baja: $low")
+            reevaluateCaps()
+            cb.onStateChanged()
+        }
+    }
+
+    // ------------------------------------------------------------------ estabilización
+
+    fun stabNow(): String = stab
+
+    /** Modos que esta cámara ofrece: off siempre; standard (EIS u OIS); cinematic (estabilización de vista previa, API 33+). */
+    fun stabModes(): List<String> {
+        val ch = anyChars() ?: return listOf("off", "standard")
+        val v = ch.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: intArrayOf()
+        val ois = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: intArrayOf()
+        val out = mutableListOf("off")
+        if (v.contains(1) || ois.contains(1)) out += "standard"
+        if (v.contains(2)) out += "cinematic"
+        return out
+    }
+
+    fun setStabilization(mode: String) {
+        stab = mode
+        DiagLog.add("estabilización: $mode")
+        pushChange()
+    }
+
+    // ------------------------------------------------------------------ controles manuales
+
+    val wbNames = listOf("Incandescente", "Fluorescente", "Luz día", "Nublado", "Sombra")
+    private val wbTemps = intArrayOf(2800, 4000, 5200, 6200, 7500)
+
+    fun manualSupported(): Boolean = anyChars()?.let { hasManualSensor(it) } == true
+
+    fun isoLimits(): Pair<Int, Int> =
+        anyChars()?.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { it.lower to it.upper } ?: (50 to 3200)
+
+    fun shutterLimits(): Pair<Double, Double> {
+        val r = anyChars()?.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+        val lo = (r?.lower ?: 100_000L) / 1e9
+        val hi = minOf((r?.upper ?: 100_000_000L) / 1e9, 1.0 / maxOf(fps, 1))
+        return lo to maxOf(hi, lo * 2)
+    }
+
+    fun exposureIsManual(): Boolean = isoManual && shutterManual
+    fun isoNow(): Int = if (exposureIsManual()) iso else lastIso
+    fun shutterNow(): Double = if (exposureIsManual()) shutter else lastExpNs / 1e9
+
+    private fun enterManualExposure() {
+        if (isoManual && shutterManual) return
+        val (lo, hi) = isoLimits()
+        if (lastIso > 0) iso = lastIso.coerceIn(lo, hi)
+        if (lastExpNs > 0) {
+            val (tl, th) = shutterLimits()
+            shutter = (lastExpNs / 1e9).coerceIn(tl, th)
+        }
+        isoManual = true; shutterManual = true
+    }
+
+    fun setExposureManual(on: Boolean) {
+        handler.post {
+            if (on && manualSupported()) enterManualExposure() else { isoManual = false; shutterManual = false }
+            applyRequest(); cb.onStateChanged()
+        }
+    }
+
+    fun setIso(v: Int) {
+        handler.post {
+            if (!manualSupported()) return@post
+            enterManualExposure()
+            val (lo, hi) = isoLimits()
+            iso = v.coerceIn(lo, hi)
+            applyRequest(); cb.onStateChanged()
+        }
+    }
+
+    fun setShutter(sec: Double) {
+        handler.post {
+            if (!manualSupported()) return@post
+            enterManualExposure()
+            val (lo, hi) = shutterLimits()
+            shutter = sec.coerceIn(lo, hi)
+            applyRequest(); cb.onStateChanged()
+        }
+    }
+
+    /** -1 = automático; 0..4 = preajuste (incandescente ... sombra). */
+    fun wbIndex(): Int {
+        if (wbMode != "locked") return -1
+        return wbTemps.indices.minByOrNull { Math.abs(wbTemps[it] - wbTemp) } ?: 2
+    }
+
+    fun setWbIndex(i: Int) {
+        handler.post {
+            if (i < 0) { wbMode = "auto"; awbLock = false }
+            else { wbMode = "locked"; wbTemp = wbTemps[i.coerceIn(0, wbTemps.size - 1)]; awbLock = false }
+            applyRequest(); cb.onStateChanged()
+        }
+    }
+
+    fun focusSupported(): Boolean =
+        (anyChars()?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f) > 0f
+
+    fun focusIsManual(): Boolean = focusLocked
+
+    /** 0 = cerca, 1 = lejos (igual que la app de iPhone). */
+    fun focusPosNow(): Float {
+        if (focusLocked) return lensPosition
+        val minD = anyChars()?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+        return if (minD > 0f) (1f - lastFocusD / minD).coerceIn(0f, 1f) else 1f
+    }
+
+    fun setFocusManual(on: Boolean) {
+        handler.post {
+            if (on) {
+                if (!focusSupported()) return@post
+                lensPosition = focusPosNow()
+                meterX = -1
+            }
+            focusLocked = on
+            applyRequest(); cb.onStateChanged()
+        }
+    }
+
+    fun setFocusPos(p: Float) {
+        handler.post {
+            if (!focusSupported()) return@post
+            lensPosition = p.coerceIn(0f, 1f)
+            focusLocked = true
+            applyRequest(); cb.onStateChanged()
+        }
+    }
+
+    // ------------------------------------------------------------------ diagnóstico
+
+    fun diagnostics(): String {
+        val sb = StringBuilder()
+        sb.appendLine("Dispositivo: ${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+        sb.appendLine("Estado: $resolution ${fps}fps $codec · calidad $quality · emitiendo=$running · recuperando=$recovering")
+        sb.appendLine("Temperatura: nivel $thermalLevel · limitado=$thermalCapped · vista previa bloqueada=$previewBlocked")
+        sb.appendLine("Último aviso: ${lastError ?: "ninguno"}")
+        sb.appendLine()
+        val ids = try { mgr.cameraIdList.toList() } catch (e: Exception) { emptyList() }
+        sb.appendLine("Cámaras (${ids.size}): ${ids.joinToString()}   · en uso: ${curId()}")
+        for (id in ids) try {
+            val ch = mgr.getCameraCharacteristics(id)
+            val face = when (ch.get(CameraCharacteristics.LENS_FACING)) { 0 -> "frontal"; 1 -> "trasera"; else -> "externa" }
+            val lvl = when (ch.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)) {
+                0 -> "LIMITED"; 1 -> "FULL"; 2 -> "LEGACY"; 3 -> "LEVEL_3"; else -> "?"
+            }
+            val ranges = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.joinToString(" ") { "${it.lower}-${it.upper}" }
+            val caps = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.joinToString(",") ?: "-"
+            sb.appendLine("· id $id ($face, $lvl, orient ${ch.get(CameraCharacteristics.SENSOR_ORIENTATION)}°)")
+            sb.appendLine("    fps AE: ${ranges ?: "-"}")
+            sb.appendLine("    capacidades: $caps")
+            sb.appendLine("    zoom: ${zoomRange(ch)} · curva de tonos: ${supportsCurve(ch)} · manual: ${hasManualSensor(ch)}")
+            sb.appendLine("    estabilización de vídeo: ${ch.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.joinToString(",") ?: "-"}" +
+                " (0 apagada, 1 normal, 2 vista previa) · óptica: ${ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.joinToString(",") ?: "-"}")
+            val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            for (r in listOf("720p", "1080p", "4K")) {
+                val sz = sizeOf(r)
+                val has = map?.getOutputSizes(MediaCodec::class.java)?.contains(sz) == true
+                val dur = if (has) map!!.getOutputMinFrameDuration(MediaCodec::class.java, sz) else 0L
+                val max = if (dur > 0) "máx ≈ ${Math.round(1e9 / dur)} fps" else "sin dato"
+                sb.appendLine("    $r por MediaCodec: ${if (has) "sí, $max" else "NO ofrecido"}")
+            }
+        } catch (e: Exception) { sb.appendLine("· id $id: error leyendo (${e.message})") }
+        sb.appendLine()
+        val id = curId()
+        if (id != null) {
+            sb.appendLine("Formatos que admiten cámara + encoder (id $id):")
+            for (c in listOf("h264", "hevc")) for (r in listOf("720p", "1080p", "4K")) {
+                val ok = listOf(30, 60).filter { supports(id, r, it, c) }
+                sb.appendLine("    $c $r: ${if (ok.isEmpty()) "no" else ok.joinToString(" y ") + " fps"}")
+            }
+        }
+        sb.appendLine()
+        sb.appendLine("Últimos eventos:")
+        sb.appendLine(DiagLog.dump())
+        return sb.toString()
+    }
+
     // ------------------------------------------------------------------ lentes
 
     private fun fmtF(x: Float) =
@@ -839,7 +1159,7 @@ class CameraEngine(ctx: Context, private val cb: Callback) {
         // Recorte por prioridad si pasa de 1 KiB.
         for (k in listOf("minShutterSeconds", "maxShutterSeconds", "minISO", "maxISO", "stabilization",
             "lensPosition", "whiteBalanceTemperature", "supportsManualExposure")) {
-            if (j.toString().toByteArray().size <= 1000) break
+            if (j.toString().toByteArray().size <= 960) break
             j.remove(k)
         }
         return j

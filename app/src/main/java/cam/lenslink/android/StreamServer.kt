@@ -55,17 +55,24 @@ class StreamServer(private val host: Host) {
         }, 2, 2, TimeUnit.SECONDS)
 
         thread(name = "lenslink-accept", isDaemon = true) {
-            try {
-                val ss = ServerSocket()
-                ss.reuseAddress = true
-                ss.bind(InetSocketAddress(Proto.PORT))
-                server = ss
-                while (running) {
-                    val s = ss.accept()
-                    serve(s)
+            // Si el puerto no se puede abrir (p. ej. aún ocupado tras reiniciar) se reintenta cada 2 s.
+            while (running) {
+                try {
+                    val ss = ServerSocket()
+                    ss.reuseAddress = true
+                    ss.bind(InetSocketAddress(Proto.PORT))
+                    server = ss
+                    DiagLog.add("servidor escuchando en el puerto ${Proto.PORT}")
+                    while (running) {
+                        val s = ss.accept()
+                        serve(s)
+                    }
+                } catch (e: Exception) {
+                    if (!running) break
+                    Log.e(TAG, "accept loop", e)
+                    DiagLog.add("servidor: ${e.message} · reintentando")
+                    try { Thread.sleep(2000) } catch (_: InterruptedException) { break }
                 }
-            } catch (e: Exception) {
-                if (running) Log.e(TAG, "accept loop", e)
             }
         }
     }

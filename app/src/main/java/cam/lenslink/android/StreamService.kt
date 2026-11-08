@@ -4,12 +4,17 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.IntentFilter
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -52,6 +57,15 @@ class StreamService : Service(), StreamServer.Host, CameraEngine.Callback {
     val clientConnected: Boolean get() = server.isConnected
 
     private var nsdListener: NsdManager.RegistrationListener? = null
+    private var netCb: ConnectivityManager.NetworkCallback? = null
+    private var thermalListener: Any? = null
+    private var started = false
+    private var batteryRx: BroadcastReceiver? = null
+    private var lowActive = false
+    @Volatile var batteryPct = -1
+        private set
+    @Volatile var batteryCharging = false
+        private set
     private var multicast: WifiManager.MulticastLock? = null
     private var wake: PowerManager.WakeLock? = null
 
@@ -71,6 +85,7 @@ class StreamService : Service(), StreamServer.Host, CameraEngine.Callback {
         engine.quality = p.getString("quality", "balanced") ?: "balanced"
         armed = p.getBoolean("armed", false)
         engine.setLook(p.getString("look", "natural") ?: "natural")
+        engine.setStabilization(p.getString("stab", "standard") ?: "standard")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -81,15 +96,25 @@ class StreamService : Service(), StreamServer.Host, CameraEngine.Callback {
             return START_NOT_STICKY
         }
         goForeground()
-        acquireLocks()
-        server.start()
-        registerNsd()
+        if (!started) {
+            started = true
+            DiagLog.add("servicio iniciado")
+            acquireLocks()
+            server.start()
+            registerNsd()
+            watchNetwork()
+            watchThermal()
+            watchBattery()
+        }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         instance = null
-        try { nsdListener?.let { (getSystemService(NSD_SERVICE) as NsdManager).unregisterService(it) } } catch (_: Exception) {}
+        unregisterNsd()
+        try { netCb?.let { (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it) } } catch (_: Exception) {}
+        unwatchThermal()
+        try { batteryRx?.let { unregisterReceiver(it) } } catch (_: Exception) {}
         server.stop()
         engine.release()
         try { multicast?.release() } catch (_: Exception) {}
@@ -133,6 +158,77 @@ class StreamService : Service(), StreamServer.Host, CameraEngine.Callback {
 
     private fun wakeOff() {
         try { if (wake?.isHeld == true) wake?.release() } catch (_: Exception) {}
+    }
+
+    private fun unregisterNsd() {
+        try { nsdListener?.let { (getSystemService(NSD_SERVICE) as NsdManager).unregisterService(it) } } catch (_: Exception) {}
+        nsdListener = null
+    }
+
+    /** Si el Wi-Fi se cae y vuelve, se vuelve a anunciar Bonjour (el plugin lo encuentra de nuevo). */
+    private fun watchNetwork() {
+        try {
+            val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            val cbk = object : ConnectivityManager.NetworkCallback() {
+                private var first = true
+                override fun onAvailable(network: Network) {
+                    if (first) { first = false; return } // el primer aviso es solo el estado inicial
+                    DiagLog.add("red disponible: se vuelve a anunciar Bonjour")
+                    main.post { unregisterNsd(); registerNsd() }
+                }
+            }
+            cm.registerDefaultNetworkCallback(cbk)
+            netCb = cbk
+        } catch (e: Exception) { Log.w(TAG, "network: ${e.message}") }
+    }
+
+    /** Batería: con <= 20 % sin cargar, el motor baja 4K a 1080p y a 30 fps. Se levanta con >= 25 % o al enchufar. */
+    private fun watchBattery() {
+        try {
+            val rx = object : BroadcastReceiver() {
+                override fun onReceive(c: Context, i: Intent) { handleBattery(i) }
+            }
+            batteryRx = rx
+            registerReceiver(rx, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.let { handleBattery(it) }
+        } catch (e: Exception) { Log.w(TAG, "battery: ${e.message}") }
+    }
+
+    private fun handleBattery(i: Intent) {
+        val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+        val pct = if (level < 0) -1 else level * 100 / maxOf(scale, 1)
+        val st = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        val charging = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL
+        val changed = pct != batteryPct || charging != batteryCharging
+        batteryPct = pct
+        batteryCharging = charging
+        val low = if (lowActive) !(charging || pct >= 25) else (pct in 0..20 && !charging)
+        if (low != lowActive) {
+            lowActive = low
+            DiagLog.add("batería $pct%: ${if (low) "baja, se limita el formato" else "recuperada"}")
+            engine.setBatteryLow(low)
+        }
+        if (changed) onStateChanged()
+    }
+
+    /** Temperatura: el motor baja bitrate / fps solo cuando el sistema avisa de calor. */
+    private fun watchThermal() {
+        if (Build.VERSION.SDK_INT < 29) return
+        try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            val l = PowerManager.OnThermalStatusChangedListener { st -> engine.setThermalLevel(st) }
+            thermalListener = l
+            pm.addThermalStatusListener(l)
+            engine.setThermalLevel(pm.currentThermalStatus)
+        } catch (e: Exception) { Log.w(TAG, "thermal: ${e.message}") }
+    }
+
+    private fun unwatchThermal() {
+        if (Build.VERSION.SDK_INT < 29) return
+        try {
+            val l = thermalListener as? PowerManager.OnThermalStatusChangedListener ?: return
+            (getSystemService(POWER_SERVICE) as PowerManager).removeThermalStatusListener(l)
+        } catch (_: Exception) {}
     }
 
     /** Anuncia _lenslink._tcp para que el plugin de OBS lo descubra por nombre. */
@@ -189,7 +285,16 @@ class StreamService : Service(), StreamServer.Host, CameraEngine.Callback {
             .put("fps", engine.fps).put("kind", "camera"))
     }
 
-    private fun sendState() = server.sendJson(Proto.STATE, engine.stateJson(paused))
+    private fun sendState() {
+        val j = engine.stateJson(paused)
+        // Batería para quien quiera leerla (el plugin de OBS actual ignora estos campos).
+        if (batteryPct >= 0) {
+            j.put("battery", batteryPct)
+            if (batteryCharging) j.put("charging", true)
+            if (lowActive) j.put("lowBattery", true)
+        }
+        server.sendJson(Proto.STATE, j)
+    }
 
     private val stateRunnable = Runnable { Thread { sendState() }.start() }
 
@@ -198,12 +303,14 @@ class StreamService : Service(), StreamServer.Host, CameraEngine.Callback {
     override fun clockNow() = engine.clockNow()
 
     override fun onConnected() {
+        DiagLog.add("OBS conectado")
         sendHello()
         if (engine.running) { sendConfig(); engine.requestKeyframe() }
         sendState()
     }
 
     override fun onDisconnected() {
+        DiagLog.add("OBS desconectado")
         tallyProgram = false; tallyPreview = false; obsHost = ""
     }
 
@@ -231,6 +338,7 @@ class StreamService : Service(), StreamServer.Host, CameraEngine.Callback {
 
     override fun onStarted(width: Int, height: Int) {
         curW = width; curH = height
+        DiagLog.add("emitiendo ${width}x$height ${engine.fps}fps ${engine.codec}")
         wakeOn()
         sendHello()   // ya sin "standby"
         sendConfig()

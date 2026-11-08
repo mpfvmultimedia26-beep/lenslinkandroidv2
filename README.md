@@ -13,6 +13,27 @@ como `_lenslink._tcp`. El **plugin de OBS no se toca**: lo ve como un teléfono 
 - Backpressure: si el Wi-Fi no da abasto se tira lo pendiente, se espera keyframe y baja el bitrate (sube de nuevo solo)
 - Bitrates iguales a la tabla de iOS (4K = 30 Mbps H.264 / 18 Mbps HEVC; «maximum» ×1.5)
 
+## Novedades v0.5
+- **Estabilización** (Ajustes): Apagada / Estándar / Cinemática. Usa la estabilización del propio teléfono (electrónica y óptica).
+  «Cinemática» es el modo más fuerte que Android ofrece a apps de terceros (necesita Android 13+ y que la cámara lo declare);
+  si el móvil falla con él, la app vuelve sola a Estándar. Los modos no disponibles salen atenuados.
+- **Batería baja**: con ≤ 20 % y sin cargar, 4K baja a 1080p y 60 fps baja a 30 fps. Se levanta con ≥ 25 % o al enchufar
+  (tras 1 minuto). Si eliges un formato a mano mientras hay límite, se respeta tu elección.
+- **Aviso de batería** (en el teléfono): icono pequeño naranja (≤ 20 %) o rojo (< 15 %) visible 5 s de cada 15 s. En la
+  pantalla atenuada, el porcentaje parpadea con el mismo color.
+- El STATE envía `battery`, `charging` y `lowBattery` por si un plugin los quiere leer. **El plugin de OBS actual los ignora.**
+
+## Novedades v0.4
+- **Controles manuales** (botón con tres deslizadores, a la izquierda): ISO y obturador (van juntos, Camera2 exige ambos),
+  balance de blancos por preajustes (incandescente … sombra) y enfoque manual. Cada uno vuelve a automático con su etiqueta.
+- **Cuadrícula** (3×3 o cruz central) y **nivel de horizonte** (acelerómetro) en Ajustes.
+- **Recuperación automática**: si la cámara o el encoder fallan mientras emites, se reintenta 5 veces (1, 2, 4, 8 y 15 s).
+  El servidor también reintenta abrir el puerto, y Bonjour se vuelve a anunciar cuando el Wi-Fi regresa.
+- **Control de temperatura**: con calor moderado baja el bitrate; con calor severo pasa a 30 fps; con calor crítico también
+  baja de 4K a 1080p. Vuelve al formato elegido tras 1 minuto fresco. La barra de estado avisa con «temp. alta».
+- **Informe de diagnóstico** (Ajustes → «Copiar informe de diagnóstico»): capacidades reales de cada cámara, formatos que
+  admiten cámara y encoder, y los últimos eventos. Pégalo en el chat si algo falla.
+
 ## Interfaz (v0.2)
 - Siempre horizontal, clara tipo cristal translúcido, con letras e iconos en gris oscuro (sin colores de acento). Vista previa 16:9 a pantalla completa.
 - **Pellizcar** = zoom · **tocar** = enfocar y medir luz · **arrastrar arriba/abajo tras enfocar** = exposición ·

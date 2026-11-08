@@ -6,7 +6,14 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -34,12 +41,14 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.sin
@@ -48,6 +57,7 @@ import kotlin.math.sin
 private val INK = Color.parseColor("#1C1C1E")   // texto e iconos principales (gris casi negro)
 private val INK2 = Color.parseColor("#5C5C61")  // texto secundario
 private val RED = Color.parseColor("#FF3B30")
+private val ORANGE = Color.parseColor("#FF9F0A")
 
 /** SurfaceView que mantiene 16:9 dentro del espacio disponible (letterbox). */
 private class AspectSurfaceView(ctx: Context) : SurfaceView(ctx) {
@@ -63,9 +73,11 @@ private class AspectSurfaceView(ctx: Context) : SurfaceView(ctx) {
 
 /** Icono dibujado a mano (sin recursos): rayo, voltear, puntos, look. */
 private class IconView(ctx: Context, private val kind: Int) : View(ctx) {
-    companion object { const val BOLT = 0; const val FLIP = 1; const val DOTS = 2; const val LOOK = 3 }
+    companion object { const val BOLT = 0; const val FLIP = 1; const val DOTS = 2; const val LOOK = 3; const val SLIDERS = 4; const val BATTERY = 5 }
 
     var active = false
+        set(v) { field = v; invalidate() }
+    var tint: Int? = null
         set(v) { field = v; invalidate() }
     private val d = resources.displayMetrics.density
     private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -87,7 +99,7 @@ private class IconView(ctx: Context, private val kind: Int) : View(ctx) {
     override fun onDraw(c: Canvas) {
         val cx = width / 2f; val cy = height / 2f
         val s = minOf(width, height) * 0.30f
-        p.color = INK
+        p.color = tint ?: INK
         p.style = Paint.Style.STROKE
         when (kind) {
             BOLT -> {
@@ -114,6 +126,24 @@ private class IconView(ctx: Context, private val kind: Int) : View(ctx) {
             LOOK -> {
                 c.drawCircle(cx - s * 0.35f, cy, s * 0.7f, p)
                 c.drawCircle(cx + s * 0.35f, cy, s * 0.7f, p)
+            }
+            SLIDERS -> {
+                val ys = floatArrayOf(-0.8f, 0f, 0.8f)
+                val xs = floatArrayOf(-0.35f, 0.4f, -0.1f)
+                for (i in 0..2) {
+                    p.style = Paint.Style.STROKE
+                    c.drawLine(cx - s, cy + ys[i] * s, cx + s, cy + ys[i] * s, p)
+                    p.style = Paint.Style.FILL
+                    c.drawCircle(cx + xs[i] * s, cy + ys[i] * s, s * 0.22f, p)
+                }
+            }
+            BATTERY -> {
+                val w = s * 1.5f; val h = s * 0.8f
+                c.drawRoundRect(RectF(cx - w, cy - h, cx + w * 0.8f, cy + h), s * 0.25f, s * 0.25f, p)
+                c.drawLine(cx + w * 0.95f, cy - h * 0.35f, cx + w * 0.95f, cy + h * 0.35f, p)
+                p.style = Paint.Style.FILL
+                c.drawRoundRect(RectF(cx - w + s * 0.3f, cy - h + s * 0.3f, cx - w + s * 1.2f, cy + h - s * 0.3f),
+                    s * 0.1f, s * 0.1f, p)
             }
         }
     }
@@ -157,6 +187,74 @@ private class FocusRing(ctx: Context) : View(ctx) {
     }
 }
 
+/** Cuadrícula y nivel de horizonte, con el mismo recuadro 16:9 que la vista previa. */
+private class OverlayView(ctx: Context) : View(ctx) {
+    var grid = 0            // 0 apagada, 1 tercios, 2 cruz central
+        set(v) { field = v; invalidate() }
+    var levelOn = false
+        set(v) { field = v; invalidate() }
+    private var angle = 0f
+    private var flat = false
+    private val d = resources.displayMetrics.density
+    private val soft = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#B3FFFFFF"); strokeWidth = 1.2f * d; style = Paint.Style.STROKE
+    }
+    private val strong = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE; strokeWidth = 2.6f * d; style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND
+    }
+    private val shade = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#40000000"); strokeWidth = 2.6f * d; style = Paint.Style.STROKE
+    }
+
+    override fun onMeasure(w: Int, h: Int) {
+        val maxW = MeasureSpec.getSize(w)
+        val maxH = MeasureSpec.getSize(h)
+        var width = maxW
+        var height = width * 9 / 16
+        if (height > maxH) { height = maxH; width = height * 16 / 9 }
+        setMeasuredDimension(width, height)
+    }
+
+    /** deg = inclinación del horizonte respecto a la pantalla (con suavizado). */
+    fun setLevel(deg: Float, isFlat: Boolean) {
+        angle += (deg - angle) * 0.3f
+        flat = isFlat
+        invalidate()
+    }
+
+    private fun line(c: Canvas, x1: Float, y1: Float, x2: Float, y2: Float) {
+        c.drawLine(x1, y1, x2, y2, shade)
+        c.drawLine(x1, y1, x2, y2, soft)
+    }
+
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat(); val h = height.toFloat()
+        when (grid) {
+            1 -> for (i in 1..2) {
+                line(c, w * i / 3f, 0f, w * i / 3f, h)
+                line(c, 0f, h * i / 3f, w, h * i / 3f)
+            }
+            2 -> {
+                val s = 16f * d
+                line(c, w / 2 - s, h / 2, w / 2 + s, h / 2)
+                line(c, w / 2, h / 2 - s, w / 2, h / 2 + s)
+            }
+        }
+        if (levelOn && !flat) {
+            val cx = w / 2; val cy = h / 2; val half = w * 0.13f
+            line(c, cx - half - 22f * d, cy, cx - half - 8f * d, cy)
+            line(c, cx + half + 8f * d, cy, cx + half + 22f * d, cy)
+            c.save()
+            c.rotate(angle, cx, cy)
+            if (abs(angle) < 1f) {
+                c.drawLine(cx - half, cy, cx + half, cy, shade)
+                c.drawLine(cx - half, cy, cx + half, cy, strong)   // a nivel: línea gruesa y sólida
+            } else line(c, cx - half, cy, cx + half, cy)
+            c.restore()
+        }
+    }
+}
+
 class MainActivity : Activity() {
 
     private val ui = Handler(Looper.getMainLooper())
@@ -169,6 +267,8 @@ class MainActivity : Activity() {
     private lateinit var tally: View
     private lateinit var statusPill: TextView
     private lateinit var batteryText: TextView
+    private lateinit var batteryBadge: IconView
+    private var dimSecs = 0
     private lateinit var hud: TextView
     private lateinit var lensCol: LinearLayout
     private lateinit var flashBtn: IconView
@@ -178,6 +278,14 @@ class MainActivity : Activity() {
     private lateinit var serverBtn: TextView
     private lateinit var ipText: TextView
     private lateinit var capsText: TextView
+    private lateinit var overlay: OverlayView
+    private lateinit var manual: LinearLayout
+    private val mBars = HashMap<String, SeekBar>()
+    private val mValues = HashMap<String, TextView>()
+    private val mChips = HashMap<String, TextView>()
+    private var updatingBars = false
+    private var resumed = false
+    private var levelRegistered = false
     private lateinit var dimLayer: FrameLayout
     private lateinit var dimBattery: TextView
 
@@ -259,6 +367,11 @@ class MainActivity : Activity() {
         })
         root.addView(preview, lp(-1, -1, Gravity.CENTER))
 
+        overlay = OverlayView(this)
+        overlay.grid = prefs.getInt("grid", 0)
+        overlay.levelOn = prefs.getBoolean("level", false)
+        root.addView(overlay, lp(-1, -1, Gravity.CENTER))
+
         // 2) gestos: pellizco = zoom, toque = enfoque, arrastre vertical tras enfocar = exposición
         touch = View(this)
         setupGestures()
@@ -289,6 +402,8 @@ class MainActivity : Activity() {
         controls.addView(statusPill, lp(-2, -2, Gravity.TOP or Gravity.START))
 
         val topRight = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        batteryBadge = IconView(this, IconView.BATTERY).apply { visibility = View.GONE }
+        topRight.addView(batteryBadge, LinearLayout.LayoutParams(dp(28), dp(24)).apply { marginEnd = dp(4) })
         batteryText = label("", 12f, INK2).apply { background = glass(14); setPadding(dp(10), dp(6), dp(10), dp(6)) }
         topRight.addView(batteryText, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(10) })
         val dots = IconView(this, IconView.DOTS).apply {
@@ -318,6 +433,23 @@ class MainActivity : Activity() {
         }
         right.addView(flip, LinearLayout.LayoutParams(dp(40), dp(40)).apply { topMargin = dp(10) })
         controls.addView(right, lp(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL))
+
+        // izquierda: abrir/cerrar controles manuales
+        val manBtn = IconView(this, IconView.SLIDERS).apply {
+            background = glass(20)
+            setOnClickListener {
+                manual.visibility = if (manual.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                settings.visibility = View.GONE
+                updateManual()
+            }
+        }
+        controls.addView(manBtn, lp(dp(40), dp(40), Gravity.START or Gravity.CENTER_VERTICAL))
+
+        manual = buildManual()
+        manual.visibility = View.GONE
+        controls.addView(manual, lp(-1, -2, Gravity.BOTTOM).apply {
+            leftMargin = dp(52); rightMargin = dp(72); bottomMargin = dp(52)
+        })
 
         // abajo: look (centro), obturador (derecha), lectura (izquierda)
         lookPill = label("NATURAL", 12f, INK, caps = true).apply {
@@ -386,6 +518,25 @@ class MainActivity : Activity() {
             StreamService.instance?.changeArmed(v == "on")
         })
 
+        add(segmented("stab", "Estabilización", listOf("off" to "Apagada", "standard" to "Estándar", "cinematic" to "Cinemática")) { v ->
+            val e = StreamService.instance?.engine
+            if (e != null && v !in e.stabModes()) {
+                toast("Tu cámara no ofrece ese modo de estabilización")
+                return@segmented
+            }
+            prefs.edit().putString("stab", v).apply()
+            e?.setStabilization(v)
+        })
+        add(segmented("grid", "Cuadrícula", listOf("0" to "Apagada", "1" to "3×3", "2" to "Centro")) { v ->
+            prefs.edit().putInt("grid", v.toInt()).apply()
+            overlay.grid = v.toInt()
+        })
+        add(segmented("level", "Nivel de horizonte", listOf("off" to "Apagado", "on" to "Activo")) { v ->
+            prefs.edit().putBoolean("level", v == "on").apply()
+            overlay.levelOn = v == "on"
+            updateLevelSensor()
+        })
+
         serverBtn = label("", 13f, INK).apply {
             gravity = Gravity.CENTER
             background = pill(Color.parseColor("#14000000"), 14)
@@ -398,6 +549,13 @@ class MainActivity : Activity() {
         add(label("Admite esta cámara", 10f, INK2, caps = true))
         capsText = label("", 11f, INK, "sans-serif")
         col.addView(capsText, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        val diagBtn = label("Copiar informe de diagnóstico", 13f, INK).apply {
+            gravity = Gravity.CENTER
+            background = pill(Color.parseColor("#14000000"), 14)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setOnClickListener { copyDiag() }
+        }
+        add(diagBtn)
 
         return ScrollView(this).apply {
             background = glass(18, true)
@@ -428,6 +586,181 @@ class MainActivity : Activity() {
         }
         col.addView(row, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5) })
         return col
+    }
+
+    // ------------------------------------------------------------------ controles manuales
+
+    private fun eng(): CameraEngine? = StreamService.instance?.engine
+
+    private fun toProg(v: Double, lo: Double, hi: Double): Int =
+        if (v <= lo || hi <= lo) 0 else (1000.0 * Math.log(v / lo) / Math.log(hi / lo)).toInt().coerceIn(0, 1000)
+
+    private fun fromProg(p: Int, lo: Double, hi: Double): Double = lo * Math.pow(hi / lo, p / 1000.0)
+
+    private fun fmtShutter(sec: Double): String = when {
+        sec <= 0.0 -> "—"
+        sec >= 0.5 -> String.format(Locale.US, "%.1fs", sec)
+        else -> "1/${Math.round(1.0 / sec)}"
+    }
+
+    private fun toggleExposure() {
+        val e = eng() ?: return
+        if (!e.manualSupported()) { toast("Esta cámara no permite exposición manual"); return }
+        e.setExposureManual(!e.exposureIsManual())
+    }
+
+    private fun buildManual(): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = glass(18, true)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+        }
+        val tint = ColorStateList.valueOf(INK)
+        val track = ColorStateList.valueOf(Color.parseColor("#33000000"))
+
+        fun col(key: String, title: String, max: Int, onChip: () -> Unit, onSeek: (Int) -> Unit) {
+            val c = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+            val chip = label(title, 10f, INK, caps = true).apply {
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+                setOnClickListener { onChip() }
+            }
+            val value = label("", 12f, INK)
+            top.addView(chip)
+            top.addView(value, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(8) })
+            val bar = SeekBar(this).apply {
+                this.max = max
+                progressTintList = tint
+                thumbTintList = tint
+                progressBackgroundTintList = track
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
+                        if (fromUser && !updatingBars) onSeek(p)
+                    }
+                    override fun onStartTrackingTouch(sb: SeekBar) {}
+                    override fun onStopTrackingTouch(sb: SeekBar) {}
+                })
+            }
+            c.addView(top)
+            c.addView(bar, LinearLayout.LayoutParams(-1, -2))
+            row.addView(c, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(6); marginEnd = dp(6) })
+            mBars[key] = bar; mValues[key] = value; mChips[key] = chip
+        }
+
+        col("iso", "ISO", 1000, { toggleExposure() }) { p ->
+            val e = eng() ?: return@col
+            val (lo, hi) = e.isoLimits()
+            e.setIso(fromProg(p, lo.toDouble(), hi.toDouble()).toInt())
+        }
+        col("exp", "Obturador", 1000, { toggleExposure() }) { p ->
+            val e = eng() ?: return@col
+            val (lo, hi) = e.shutterLimits()
+            e.setShutter(fromProg(p, lo, hi))
+        }
+        col("wb", "Blancos", 4, {
+            val e = eng() ?: return@col
+            e.setWbIndex(if (e.wbIndex() >= 0) -1 else 2)
+        }) { p -> eng()?.setWbIndex(p) }
+        col("focus", "Enfoque", 1000, {
+            val e = eng() ?: return@col
+            if (!e.focusSupported()) { toast("Esta cámara tiene el enfoque fijo"); return@col }
+            e.setFocusManual(!e.focusIsManual())
+        }) { p -> eng()?.setFocusPos(p / 1000f) }
+        return row
+    }
+
+    private fun chipStyle(key: String, manualOn: Boolean) {
+        mChips[key]?.background = pill(if (manualOn) Color.WHITE else Color.parseColor("#14000000"), 10)
+    }
+
+    private fun updateManual() {
+        if (manual.visibility != View.VISIBLE) return
+        val e = eng() ?: return
+        updatingBars = true
+        try {
+            val man = e.exposureIsManual()
+            val (iLo, iHi) = e.isoLimits()
+            val (tLo, tHi) = e.shutterLimits()
+            val iso = e.isoNow()
+            val sh = e.shutterNow()
+            mValues["iso"]?.text = if (iso > 0) iso.toString() else "—"
+            mValues["exp"]?.text = fmtShutter(sh)
+            val isoBar = mBars["iso"]; val expBar = mBars["exp"]
+            if (isoBar != null && !isoBar.isPressed) isoBar.progress = toProg(iso.toDouble(), iLo.toDouble(), iHi.toDouble())
+            if (expBar != null && !expBar.isPressed) expBar.progress = toProg(sh, tLo, tHi)
+            isoBar?.alpha = if (man) 1f else 0.5f
+            expBar?.alpha = if (man) 1f else 0.5f
+            chipStyle("iso", man); chipStyle("exp", man)
+
+            val wi = e.wbIndex()
+            mValues["wb"]?.text = if (wi < 0) "Auto" else e.wbNames[wi]
+            val wbBar = mBars["wb"]
+            if (wbBar != null && !wbBar.isPressed) wbBar.progress = if (wi < 0) 2 else wi
+            wbBar?.alpha = if (wi >= 0) 1f else 0.5f
+            chipStyle("wb", wi >= 0)
+
+            val fm = e.focusIsManual()
+            val pos = e.focusPosNow()
+            mValues["focus"]?.text = if (fm) "${(pos * 100).toInt()}%" else "AF"
+            val fBar = mBars["focus"]
+            if (fBar != null && !fBar.isPressed) fBar.progress = (pos * 1000).toInt()
+            fBar?.alpha = if (fm) 1f else 0.5f
+            chipStyle("focus", fm)
+        } finally { updatingBars = false }
+    }
+
+    // ------------------------------------------------------------------ informe de diagnóstico
+
+    private fun copyDiag() {
+        val e = eng()
+        toast("Generando informe…")
+        Thread {
+            val sb = StringBuilder()
+            try {
+                val v = packageManager.getPackageInfo(packageName, 0).versionName
+                sb.append("LensLink Android $v\n")
+            } catch (_: Exception) {}
+            sb.append(e?.diagnostics()
+                ?: ("Servidor apagado: enciéndelo para leer las capacidades de la cámara.\n" + DiagLog.dump()))
+            runOnUiThread {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("LensLink", sb.toString()))
+                toast("Informe copiado: pégalo en el chat")
+            }
+        }.start()
+    }
+
+    // ------------------------------------------------------------------ nivel de horizonte
+
+    private val sm by lazy { getSystemService(Context.SENSOR_SERVICE) as SensorManager }
+
+    private val levelListener = object : SensorEventListener {
+        override fun onSensorChanged(ev: SensorEvent) {
+            val ax = ev.values[0]; val ay = ev.values[1]; val az = ev.values[2]
+            // ejes del dispositivo -> ejes de la pantalla según la rotación
+            val (sx, sy) = when (rotationDeg()) {
+                90 -> ay to -ax
+                270 -> -ay to ax
+                180 -> -ax to -ay
+                else -> ax to ay
+            }
+            val ang = Math.toDegrees(atan2(sx.toDouble(), sy.toDouble())).toFloat()
+            overlay.setLevel(ang, abs(az) > 8.8f)   // casi tumbado: el nivel no tiene sentido
+        }
+        override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+    }
+
+    private fun updateLevelSensor() {
+        val want = overlay.levelOn && !dimmed && resumed
+        if (want && !levelRegistered) {
+            sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
+                sm.registerListener(levelListener, it, SensorManager.SENSOR_DELAY_UI)
+                levelRegistered = true
+            }
+        } else if (!want && levelRegistered) {
+            sm.unregisterListener(levelListener)
+            levelRegistered = false
+        }
     }
 
     // ------------------------------------------------------------------ gestos
@@ -584,11 +917,22 @@ class MainActivity : Activity() {
     private val idle = Runnable { dim() }
     private val dimTick = object : Runnable {
         override fun run() {
-            // Cambia de sitio cada 30 s para no marcar la pantalla OLED y refresca la batería.
-            dimBattery.text = batteryLabel()
-            dimBattery.translationX = ((Math.random() - 0.5) * dp(160)).toFloat()
-            dimBattery.translationY = ((Math.random() - 0.5) * dp(120)).toFloat()
-            ui.postDelayed(this, 30_000)
+            val (pct, charging) = batteryInfo()
+            if (dimSecs % 30 == 0) {
+                // Cambia de sitio cada 30 s para no marcar la pantalla OLED.
+                dimBattery.translationX = ((Math.random() - 0.5) * dp(160)).toFloat()
+                dimBattery.translationY = ((Math.random() - 0.5) * dp(120)).toFloat()
+            }
+            dimBattery.text = if (pct < 0) "--" else "$pct%"
+            val low = pct in 0..20 && !charging
+            val blink = (System.currentTimeMillis() / 1000) % 15 < 5     // 5 s de cada 15 s
+            dimBattery.setTextColor(when {
+                low && blink && pct <= 14 -> Color.parseColor("#CCFF3B30")
+                low && blink -> Color.parseColor("#CCFF9F0A")
+                else -> Color.parseColor("#55FFFFFF")
+            })
+            dimSecs++
+            ui.postDelayed(this, 1000)
         }
     }
 
@@ -606,18 +950,22 @@ class MainActivity : Activity() {
         if (dimmed) return
         dimmed = true
         settings.visibility = View.GONE
+        manual.visibility = View.GONE
+        updateLevelSensor()
         dimLayer.visibility = View.VISIBLE
         setBrightness(0.01f)
         ui.removeCallbacks(tick)
         // Sin emitir no hace falta cámara abierta: se suelta la vista previa (la cámara se apaga).
         val s = StreamService.instance
         if (s != null && !s.engine.running) { s.engine.setPreview(null); previewAttached = false }
+        dimSecs = 0
         ui.post(dimTick)
     }
 
     private fun wake() {
         if (!dimmed) return
         dimmed = false
+        updateLevelSensor()
         dimLayer.visibility = View.GONE
         setBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE)
         ui.removeCallbacks(dimTick)
@@ -626,14 +974,17 @@ class MainActivity : Activity() {
         scheduleIdle()
     }
 
-    private fun batteryPct(): Int {
-        val i = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return -1
+    /** (porcentaje, cargando). Porcentaje -1 si no se puede leer. */
+    private fun batteryInfo(): Pair<Int, Boolean> {
+        val i = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return -1 to false
         val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
-        return if (level < 0) -1 else level * 100 / max(scale, 1)
+        val st = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        val charging = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL
+        return (if (level < 0) -1 else level * 100 / max(scale, 1)) to charging
     }
 
-    private fun batteryLabel(): String = batteryPct().let { if (it < 0) "--" else "$it%" }
+    private fun batteryLabel(): String = batteryInfo().first.let { if (it < 0) "--" else "$it%" }
 
     // ------------------------------------------------------------------ refresco periódico
 
@@ -697,18 +1048,26 @@ class MainActivity : Activity() {
         attachPreview()
 
         val e = s?.engine
-        batteryText.text = batteryLabel()
+        val (bPct, bCharging) = batteryInfo()
+        batteryText.text = if (bPct < 0) "--" else "$bPct%"
+        val bLow = bPct in 0..20 && !bCharging
+        val bBlink = (System.currentTimeMillis() / 1000) % 15 < 5       // 5 s de cada 15 s
+        batteryBadge.tint = if (bPct in 0..14) RED else ORANGE          // rojo por debajo del 15 %
+        batteryBadge.visibility = if (bLow && bBlink) View.VISIBLE else View.GONE
 
         // estado
         val dot = if (e?.running == true) "●" else "○"
+        val heat = (if ((e?.thermalLevel ?: 0) >= 2) " · temp. alta" else "") +
+            (if (e?.batteryLow == true) " · batería baja" else "")
         val txt = when {
             s == null -> "Servidor apagado"
+            e != null && e.recovering -> "○  Recuperando cámara…"
             e!!.running -> "$dot  EN VIVO · ${e.resolution} · ${e.fps} · ${e.codec.uppercase()}" +
                 (if (s.paused) " · pausa" else "") + (if (s.clientConnected) "" else " · sin OBS")
             s.clientConnected -> "$dot  OBS conectado"
             else -> "$dot  Esperando OBS"
         }
-        val sb = SpannableStringBuilder(txt)
+        val sb = SpannableStringBuilder(txt + heat)
         if (e?.running == true) sb.setSpan(ForegroundColorSpan(RED), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         statusPill.text = sb
         tally.visibility = if (s?.tallyProgram == true) View.VISIBLE else View.GONE
@@ -742,6 +1101,11 @@ class MainActivity : Activity() {
                 "${it.key}   ${it.value.joinToString(" · ").ifEmpty { "no disponible" }} fps"
             }
         }
+        segSetters["stab"]?.invoke(e?.stabNow() ?: prefs.getString("stab", "standard") ?: "standard")
+        if (e != null) dimOptions("stab", e.stabModes().toSet())
+        segSetters["grid"]?.invoke(overlay.grid.toString())
+        segSetters["level"]?.invoke(if (overlay.levelOn) "on" else "off")
+        updateManual()
         serverBtn.text = if (s == null) "Encender servidor" else "Apagar servidor"
         ipText.text = "${localIps()} : ${Proto.PORT}" +
             (if (s?.obsHost?.isNotEmpty() == true) "\nOBS: ${s.obsHost}" else "")
@@ -770,11 +1134,15 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         immersive()
+        resumed = true
         if (dimmed) wake() else { ui.post(tick); scheduleIdle() }
+        updateLevelSensor()
     }
 
     override fun onPause() {
         super.onPause()
+        resumed = false
+        updateLevelSensor()
         ui.removeCallbacks(tick); ui.removeCallbacks(idle); ui.removeCallbacks(dimTick)
         dimmed = false
         dimLayer.visibility = View.GONE
